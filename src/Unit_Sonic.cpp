@@ -7,7 +7,7 @@
 */
 
 /* Initializes the I2C bus for the sensor*/
-void SONIC_I2C::begin(TwoWire* wire, uint8_t addr, uint8_t sda, uint8_t scl, uint32_t speed) {
+uint8_t SONIC_I2C::begin(TwoWire* wire, uint8_t addr, uint8_t sda, uint8_t scl, uint32_t speed) {
     _wire  = wire;
     _addr  = addr;
     _sda   = sda;
@@ -15,27 +15,26 @@ void SONIC_I2C::begin(TwoWire* wire, uint8_t addr, uint8_t sda, uint8_t scl, uin
     _speed = speed;
     _wire->begin((int)_sda, (int)_scl, (uint32_t)_speed);
     _sensor_busy = false;
+
+    /* Verify that the sensor is connected */
+    _wire->beginTransmission(addr);
+
+    /* endTransmission returns 0 on success*/
+    if(!_wire->endTransmission()) {
+        _sensor_detected = true;
+    } else {
+        _sensor_detected = false;
+        _wire->end();       // end the wire session to allow the user to call begin again if they want to keep trying
+    }
+
+    return _sensor_detected;
 }
 
-/* Gets the raw distance in mm of the sensor */
-float SONIC_I2C::getDistance() {
-    /* 
-        Since we now have a global data tracking the integer of the readings, 
-        simply make sure its up to date and then convert it to a floating point
-    */
-
-    /* Ensure the global data is up to date -- but don't use the returned value, it will be truncated */
-    getDistance_uint16();
-
-    /* Convert the distance to floating point and in mm */
-    float Distance = float(_sensor_data) / 1000.0;
-
-    /* Clamp the max distance */
-    return min(Distance, float(SONIC_MAX_DISTANCE));
-}
-
-/* Gets the raw distance in mm of the sensor, truncated to the nearest mm */
-uint16_t SONIC_I2C::getDistance_uint16() {
+/* 
+    Checks whether or not new data is available - this should be polled in the user's loop.  Once the function
+    returns true --> the user should get the new data by calling the respective getDistance() or getDistance_uint16()
+*/
+uint8_t SONIC_I2C::readingAvailable() {
     /* 
         I'm not able to find a datasheet for this chip, so reverse engineering a bit from 
         the original driver.  They send 0x01 to the chip, wait 120ms, then read 3 bytes back.
@@ -48,6 +47,8 @@ uint16_t SONIC_I2C::getDistance_uint16() {
         data.  If the timer has expired, then we'll grab new data to return.  Easy peasy.
    */
 
+    /* Verify the sensor was detected */
+    if(!_sensor_detected) {return false;}
 
     if(!_sensor_busy) {
         /* Trigger a data collection */
@@ -58,6 +59,7 @@ uint16_t SONIC_I2C::getDistance_uint16() {
         /* Start the timer and flag that the sensor is busy */
         _sensor_busy = true;
         start_timer(&_sensor_data_timer);
+
     }
 
     /* See if the new data is available */
@@ -76,9 +78,44 @@ uint16_t SONIC_I2C::getDistance_uint16() {
         /* Flag that the sensor is no longer busy and stop the timer */
         _sensor_busy = false;
         stop_timer(&_sensor_data_timer);
+
+        /* Flag that the sensor has data available */
+        return true;
     }
 
+    /* If we made it here, there isn't any new data */
+    return false;
+}
+
+/* 
+    Gets the raw distance in mm of the sensor.  This will always contain the latest reading.  If the user wishes
+    to implement any averaging, it is necessary to only call this function once readingAvailable() returns true.
+    Otherwise, the user will read the same data over and over throwing off the average count.
+*/
+float SONIC_I2C::getDistance() {
+    /* 
+        Since we now have a global data tracking the integer of the readings, 
+        simply make sure its up to date and then convert it to a floating point
+    */
+
+    /* Ensure the global data is up to date -- but don't use the returned value, it will be truncated */
+    getDistance_uint16();
+
+    /* Convert the distance to floating point and in mm */
+    float Distance = float(_sensor_data) / 1000.0;
+
     /* Clamp the max distance */
+    return min(Distance, float(SONIC_MAX_DISTANCE));
+}
+
+/* 
+    Gets the raw distance truncated to the nearest mm of the sensor.  This will always contain the latest reading.  
+    If the user wishes to implement any averaging, it is necessary to only call this function once readingAvailable() returns true.
+    Otherwise, the user will read the same data over and over throwing off the average count.
+*/
+uint16_t SONIC_I2C::getDistance_uint16() {
+
+    /* Clamp the max distance to be returned */
     return min((uint16_t)(_sensor_data / 1000), (uint16_t)SONIC_MAX_DISTANCE);
 }
 
