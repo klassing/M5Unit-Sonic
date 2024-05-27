@@ -13,21 +13,15 @@ uint8_t SONIC_I2C::begin(TwoWire* wire, uint8_t addr, uint8_t sda, uint8_t scl, 
     _sda   = sda;
     _scl   = scl;
     _speed = speed;
+    _wire->end();   //Verify the I2C bus hasn't been initialized previously with different configs
     _wire->begin((int)_sda, (int)_scl, (uint32_t)_speed);
     _sensor_busy = false;
 
-    /* Verify that the sensor is connected */
-    _wire->beginTransmission(addr);
+    /* Verify that a sensor was detected */
+    _wire->beginTransmission(_addr);
 
     /* endTransmission returns 0 on success*/
-    if(!_wire->endTransmission()) {
-        _sensor_detected = true;
-    } else {
-        _sensor_detected = false;
-        _wire->end();       // end the wire session to allow the user to call begin again if they want to keep trying
-    }
-
-    return _sensor_detected;
+    return !_wire->endTransmission();
 }
 
 /* 
@@ -47,10 +41,8 @@ uint8_t SONIC_I2C::readingAvailable() {
         data.  If the timer has expired, then we'll grab new data to return.  Easy peasy.
    */
 
-    /* Verify the sensor was detected */
-    if(!_sensor_detected) {return false;}
-
     if(!_sensor_busy) {
+
         /* Trigger a data collection */
         _wire->beginTransmission(_addr);    // Transfer data to 0x57. 将数据传输到0x57
         _wire->write(0x01);                 // Trigger the sensor reading
@@ -59,7 +51,6 @@ uint8_t SONIC_I2C::readingAvailable() {
         /* Start the timer and flag that the sensor is busy */
         _sensor_busy = true;
         start_timer(&_sensor_data_timer);
-
     }
 
     /* See if the new data is available */
@@ -98,9 +89,6 @@ float SONIC_I2C::getDistance() {
         simply make sure its up to date and then convert it to a floating point
     */
 
-    /* Ensure the global data is up to date -- but don't use the returned value, it will be truncated */
-    getDistance_uint16();
-
     /* Convert the distance to floating point and in mm */
     float Distance = float(_sensor_data) / 1000.0;
 
@@ -133,40 +121,128 @@ uint8_t SONIC_I2C::timer_expired(uint32_t *timer, uint32_t timeout) {return (mil
 /* Private function to stop/reset a timer */
 void SONIC_I2C::stop_timer(uint32_t *timer) {*timer = 0;}
 
-/*! @brief Initialize the Sonic. */
-void SONIC_IO::begin(uint8_t trig, uint8_t echo) {
-    _trig = trig;
-    _echo = echo;
-    pinMode(_trig,
-            OUTPUT);  // Sets the trigPin as an Output. 将 TrigPin 设置为输出
-    pinMode(_echo,
-            INPUT);  // Sets the echoPin as an Input. 将 echoPin 设置为输入
+/* Initializes the private variables for the sensor */
+void SONIC_IO::begin(uint8_t trig_pin /*=26*/, uint8_t echo_pin /*=32*/) {
+    _trig_pin = trig_pin;
+    _echo_pin = echo_pin;
+    _sensor_pulse_duration = 0;
+    _sensor_busy = false;
+    _sensor_data_ready = false;
+
+    pinMode(_trig_pin, OUTPUT);
+    pinMode(_echo_pin, INPUT);
 }
 
-float SONIC_IO::getDuration() {
-    digitalWrite(_trig, LOW);
-    delayMicroseconds(2);
-    // Sets the trigPin on HIGH state for 10 micro seconds.
-    // 将TrigPin设定为高电平状态，持续10微秒。
+/* 
+    This should be called by the user's ISR on the echo pin, set to RISING edge trigger.
+    This will start the pulse measuring timer.
+*/
+void SONIC_IO::echo_isr_rising() {
+    /* Start the pulse measurement timer */
+    _sensor_pulse_start = micros();
 
-    digitalWrite(_trig, HIGH);
-    delayMicroseconds(10);
-    digitalWrite(_trig, LOW);
-
-    // Reads the echoPin, returns the sound wave travel time in microseconds
-    //读取echoPin，返回以微秒为单位的声波移动时间
-    float duration = pulseIn(_echo, HIGH);
-
-    return duration;
 }
 
-/*! @brief Get distance data. */
-float SONIC_IO::getDistance() {
-    // Calculating the distance
-    float Distance = getDuration() * 0.34 / 2;
-    if (Distance > 4500.00) {
-        return 4500.00;
-    } else {
-        return Distance;
+/* 
+    This should be called by the user's ISR on the echo pin, set to RISING edge trigger.
+    This will be used to calculate the duration of the echo pulse
+*/
+void SONIC_IO::echo_isr_falling() {
+    /* Calculate the pulse duration */
+    _sensor_pulse_duration = micros() - _sensor_pulse_start;
+
+    /* Flag that the sensor is no longer busy */
+    _sensor_data_ready = true;
+
+}
+
+/* 
+    Checks whether or not new data is available - this should be polled in the user's loop.  Once the function
+    returns true --> the user should get the new data by calling the respective getDistance() or getDistance_uint16()
+*/
+uint8_t SONIC_IO::readingAvailable() {
+    /* 
+        I'm not able to find a datasheet for this chip, so reverse engineering a bit from 
+        the original driver.  They send a 10us pulse on the _trig_pin, then measure a pulse
+        of LOW-HIGH-LOW (duration of HIGH) in microseconds, to determine the amount of time
+        for sound to travel to the target and return.
+   */
+
+    if(!_sensor_busy) {
+
+        /* Trigger a data collection */
+        digitalWrite(_trig_pin, HIGH);
+        delayMicroseconds(SONIC_IO_TRIG_PULSE_US);
+        digitalWrite(_trig_pin, LOW);
+
+        /* Start the timeout timer and flag that the sensor is busy */
+        _sensor_busy = true;
+        _sensor_data_ready = false;
+        start_timer(&_sensor_timeout_timer);
     }
+
+    /* See if there is new data available */
+    if(_sensor_data_ready) {
+        _sensor_data = U32_SONIC_PULSE_TO_UM(_sensor_pulse_duration);
+
+        data_collected();
+
+        /* Flag that the sensor has data available */
+        return true;
+    }
+
+    /* See if a timeout has occured */
+    if(timer_expired(&_sensor_timeout_timer, SONIC_IO_TIMEOUT_MS)) {
+        /* Clear all pending measurements since the object is too far away to measure */
+        _sensor_data = SONIC_MAX_DISTANCE;
+        data_collected();
+
+        /* Flag that the sensor has data available */
+        return true;
+    }
+
+    /* If we made it here, there isn't any new data */
+    return false;
+}
+
+/* 
+    Gets the raw distance in mm of the sensor.  This will always contain the latest reading.  If the user wishes
+    to implement any averaging, it is necessary to only call this function once readingAvailable() returns true.
+    Otherwise, the user will read the same data over and over throwing off the average count.
+*/
+float SONIC_IO::getDistance() {
+    /* Clamp the max distance to be returned */
+    return min(F_SONIC_UM_TO_MM(_sensor_data), float(SONIC_MAX_DISTANCE));
+}
+
+/* 
+    Gets the raw distance truncated to the nearest mm of the sensor.  This will always contain the latest reading.  
+    If the user wishes to implement any averaging, it is necessary to only call this function once readingAvailable() returns true.
+    Otherwise, the user will read the same data over and over throwing off the average count.
+*/
+uint16_t SONIC_IO::getDistance_uint16() {
+
+    /* Clamp the max distance to be returned */
+    return min(U16_SONIC_UM_TO_MM(_sensor_data), (uint16_t)SONIC_MAX_DISTANCE);
+}
+
+/* Allows the calling functions to check whether or not the sensor is busy */
+uint8_t SONIC_IO::getStatus() {
+    return _sensor_busy;
+}
+
+/* Private function to start various timers */
+void SONIC_IO::start_timer(uint32_t *timer) {*timer = millis();}
+
+/* Private function to check if a timer has expired */
+uint8_t SONIC_IO::timer_expired(uint32_t *timer, uint32_t timeout) {return (millis() - *timer > timeout && *timer != 0) ? true : false;}
+
+/* Private function to stop/reset a timer */
+void SONIC_IO::stop_timer(uint32_t *timer) {*timer = 0;}
+
+/* Private function to clear variables when we've completed a new measurement */
+void SONIC_IO::data_collected() {
+    stop_timer(&_sensor_timeout_timer);
+    _sensor_data_ready = false;
+    _sensor_busy = false;
 }
